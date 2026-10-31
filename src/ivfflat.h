@@ -9,6 +9,7 @@
 #include "common/pg_prng.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
+#include "parallelbuild.h"
 #include "port.h"				/* for random() */
 #include "storage/condition_variable.h"
 #include "utils/sampling.h"
@@ -137,30 +138,14 @@ typedef struct IvfflatSpool
 
 typedef struct IvfflatShared
 {
-	/* Immutable state */
-	Oid			heaprelid;
-	Oid			indexrelid;
-	bool		isconcurrent;
-	int			scantuplesortstates;
-
-	/* Worker progress */
-	ConditionVariable workersdonecv;
-
-	/* Mutex for mutable state */
-	slock_t		mutex;
-
-	/* Mutable state */
-	int			nparticipantsdone;
-	double		reltuples;
-	double		indtuples;
+	/* State common to all parallel index builds; must be first */
+	ParallelIndexBuildShared base;
 
 #ifdef IVFFLAT_KMEANS_DEBUG
+	/* Mutable state, protected by base.mutex */
 	double		inertia;
 #endif
 }			IvfflatShared;
-
-#define ParallelTableScanFromIvfflatShared(shared) \
-	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(IvfflatShared)))
 
 typedef struct IvfflatLeader
 {
@@ -170,6 +155,8 @@ typedef struct IvfflatLeader
 	Sharedsort *sharedsort;
 	Snapshot	snapshot;
 	char	   *ivfcenters;
+	WalUsage   *walusage;
+	BufferUsage *bufferusage;
 }			IvfflatLeader;
 
 typedef struct IvfflatTypeInfo
