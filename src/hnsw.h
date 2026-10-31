@@ -9,6 +9,7 @@
 #include "access/parallel.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
+#include "parallelbuild.h"
 #include "port.h"				/* for random() */
 #include "storage/bufpage.h"
 #include "storage/condition_variable.h"
@@ -250,20 +251,10 @@ typedef struct HnswGraph
 
 typedef struct HnswShared
 {
-	/* Immutable state */
-	Oid			heaprelid;
-	Oid			indexrelid;
-	bool		isconcurrent;
+	/* State common to all parallel index builds; must be first */
+	ParallelIndexBuildShared base;
 
-	/* Worker progress */
-	ConditionVariable workersdonecv;
-
-	/* Mutex for mutable state */
-	slock_t		mutex;
-
-	/* Mutable state */
-	int			nparticipantsdone;
-	double		reltuples;
+	/* Graph, protected by its own locks */
 	HnswGraph	graphData;
 }			HnswShared;
 
@@ -277,6 +268,8 @@ typedef struct HnswLeader
 	HnswShared *hnswshared;
 	Snapshot	snapshot;
 	char	   *hnswarea;
+	WalUsage   *walusage;
+	BufferUsage *bufferusage;
 }			HnswLeader;
 
 typedef struct HnswAllocator
