@@ -44,6 +44,7 @@
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000004)
 #define PARALLEL_KEY_WAL_USAGE			UINT64CONST(0xA000000000000005)
 #define PARALLEL_KEY_BUFFER_USAGE		UINT64CONST(0xA000000000000006)
+#define PARALLEL_KEY_TABLE_SCAN			UINT64CONST(0xA000000000000007)
 
 /*
  * Add sample
@@ -622,8 +623,8 @@ ParallelHeapScan(IvfflatBuildState * buildstate)
 
 	ParallelIndexBuildWaitForWorkers(&ivfshared->base,
 									 buildstate->ivfleader->nparticipanttuplesorts,
-									 &reltuples, &buildstate->indtuples,
-									 NULL, NULL);
+									 buildstate->indexInfo,
+									 &reltuples, &buildstate->indtuples, NULL);
 
 #ifdef IVFFLAT_KMEANS_DEBUG
 	/* All participants are done, so no further updates can happen */
@@ -637,13 +638,11 @@ ParallelHeapScan(IvfflatBuildState * buildstate)
  * Perform a worker's portion of a parallel sort
  */
 static void
-IvfflatParallelScanAndSort(IvfflatSpool * ivfspool, IvfflatShared * ivfshared, Sharedsort *sharedsort, char *ivfcenters, int sortmem, bool progress)
+IvfflatParallelScanAndSort(IvfflatSpool * ivfspool, IvfflatShared * ivfshared, shm_toc *toc, Sharedsort *sharedsort, char *ivfcenters, int sortmem, bool progress)
 {
 	SortCoordinate coordinate;
 	IvfflatBuildState buildstate;
-	TableScanDesc scan;
 	double		reltuples;
-	IndexInfo  *indexInfo;
 
 	/* Initialize local tuplesort coordination state */
 	coordinate = palloc0_object(SortCoordinateData);
@@ -651,23 +650,18 @@ IvfflatParallelScanAndSort(IvfflatSpool * ivfspool, IvfflatShared * ivfshared, S
 	coordinate->nParticipants = -1;
 	coordinate->sharedsort = sharedsort;
 
-	/* Join parallel scan */
-	indexInfo = BuildIndexInfo(ivfspool->index);
-	indexInfo->ii_Concurrent = ivfshared->base.isconcurrent;
-	InitBuildState(&buildstate, ivfspool->heap, ivfspool->index, indexInfo);
+	/* The IndexInfo for the scan is owned by ParallelIndexBuildScan */
+	InitBuildState(&buildstate, ivfspool->heap, ivfspool->index, NULL);
 	memcpy(buildstate.centers->items, ivfcenters, mul_size(buildstate.centers->itemsize, buildstate.centers->maxlen));
 	buildstate.centers->length = buildstate.centers->maxlen;
 	ivfspool->sortstate = InitBuildSortState(buildstate.sortdesc, sortmem, coordinate);
 	buildstate.sortstate = ivfspool->sortstate;
-	scan = table_beginscan_parallel(ivfspool->heap,
-									ParallelTableScanFromIvfflatShared(ivfshared)
-#if PG_VERSION_NUM >= 190000
-									,SO_NONE
-#endif
-		);
-	reltuples = table_index_build_scan(ivfspool->heap, ivfspool->index, indexInfo,
-									   true, progress, BuildCallback,
-									   (void *) &buildstate, scan);
+
+	/* Join parallel scan */
+	reltuples = ParallelIndexBuildScan(&ivfshared->base, toc,
+									   PARALLEL_KEY_TABLE_SCAN, ivfspool->heap,
+									   ivfspool->index, progress, BuildCallback,
+									   (void *) &buildstate);
 
 	/* Execute this worker's part of the sort */
 	tuplesort_performsort(ivfspool->sortstate);
@@ -687,7 +681,7 @@ IvfflatParallelScanAndSort(IvfflatSpool * ivfspool, IvfflatShared * ivfshared, S
 
 	/* Record statistics and notify leader */
 	ParallelIndexBuildReportScanDone(&ivfshared->base, reltuples,
-									 buildstate.indtuples, false, false);
+									 buildstate.indtuples, false);
 
 	/* We can end tuplesorts immediately */
 	tuplesort_end(ivfspool->sortstate);
@@ -736,7 +730,7 @@ IvfflatParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 
 	/* Perform sorting */
 	sortmem = maintenance_work_mem / ivfshared->base.scantuplesortstates;
-	IvfflatParallelScanAndSort(ivfspool, ivfshared, sharedsort, ivfcenters, sortmem, false);
+	IvfflatParallelScanAndSort(ivfspool, ivfshared, toc, sharedsort, ivfcenters, sortmem, false);
 
 	/* Report WAL/buffer usage during parallel execution */
 	bufferusage = shm_toc_lookup(toc, PARALLEL_KEY_BUFFER_USAGE, false);
@@ -776,8 +770,8 @@ IvfflatLeaderParticipateAsWorker(IvfflatBuildState * buildstate)
 	/* Perform work common to all participants */
 	sortmem = maintenance_work_mem / ivfleader->nparticipanttuplesorts;
 	IvfflatParallelScanAndSort(leaderworker, ivfleader->ivfshared,
-							   ivfleader->sharedsort, ivfleader->ivfcenters,
-							   sortmem, true);
+							   ivfleader->pcxt->toc, ivfleader->sharedsort,
+							   ivfleader->ivfcenters, sortmem, true);
 }
 
 /*
@@ -814,8 +808,8 @@ IvfflatBeginParallel(IvfflatBuildState * buildstate, bool isconcurrent, int requ
 	snapshot = ParallelIndexBuildGetSnapshot(isconcurrent);
 
 	/* Estimate size of workspaces */
-	estivfshared = ParallelIndexBuildEstimateShared(buildstate->heap, snapshot,
-													sizeof(IvfflatShared));
+	ParallelIndexBuildEstimate(pcxt, buildstate->heap, snapshot);
+	estivfshared = sizeof(IvfflatShared);
 	shm_toc_estimate_chunk(&pcxt->estimator, estivfshared);
 	estsort = tuplesort_estimate_shared(scantuplesortstates);
 	shm_toc_estimate_chunk(&pcxt->estimator, estsort);
@@ -846,12 +840,11 @@ IvfflatBeginParallel(IvfflatBuildState * buildstate, bool isconcurrent, int requ
 
 	/* Store shared build state, for which we reserved space */
 	ivfshared = (IvfflatShared *) shm_toc_allocate(pcxt->toc, estivfshared);
-	/* Initialize common state, and the parallel scan that follows the struct */
-	ParallelIndexBuildInitShared(&ivfshared->base, buildstate->heap,
+	/* Initialize common state, and the parallel table scan */
+	ParallelIndexBuildInitShared(pcxt, &ivfshared->base,
+								 PARALLEL_KEY_TABLE_SCAN, buildstate->heap,
 								 buildstate->index, isconcurrent,
-								 scantuplesortstates,
-								 ParallelTableScanFromIvfflatShared(ivfshared),
-								 snapshot);
+								 scantuplesortstates, snapshot);
 #ifdef IVFFLAT_KMEANS_DEBUG
 	ivfshared->inertia = 0;
 #endif

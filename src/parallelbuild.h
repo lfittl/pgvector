@@ -26,6 +26,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "executor/instrument.h"
 #include "pgstat.h"
 #include "storage/condition_variable.h"
@@ -88,20 +89,26 @@ ParallelIndexBuildGetSnapshot(bool isconcurrent)
 	return RegisterSnapshot(GetTransactionSnapshot());
 }
 
-static inline Size
-ParallelIndexBuildEstimateShared(Relation heap, Snapshot snapshot,
-								 Size am_shared_size)
+static inline void
+ParallelIndexBuildEstimate(ParallelContext *pcxt, Relation heap,
+						   Snapshot snapshot)
 {
-	return add_size(BUFFERALIGN(am_shared_size),
-					table_parallelscan_estimate(heap, snapshot));
+	/* Space for the parallel table scan descriptor */
+	shm_toc_estimate_chunk(&pcxt->estimator,
+						   table_parallelscan_estimate(heap, snapshot));
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
 
 static inline void
-ParallelIndexBuildInitShared(ParallelIndexBuildShared * shared,
+ParallelIndexBuildInitShared(ParallelContext *pcxt,
+							 ParallelIndexBuildShared * shared,
+							 uint64 pscan_key,
 							 Relation heap, Relation index,
 							 bool isconcurrent, int scantuplesortstates,
-							 ParallelTableScanDesc pscan, Snapshot snapshot)
+							 Snapshot snapshot)
 {
+	ParallelTableScanDesc pscan;
+
 	/* Initialize immutable state */
 	shared->heaprelid = RelationGetRelid(heap);
 	shared->indexrelid = RelationGetRelid(index);
@@ -122,14 +129,19 @@ ParallelIndexBuildInitShared(ParallelIndexBuildShared * shared,
 	shared->havedead = false;
 	shared->brokenhotchain = false;
 
+	/* Set up the parallel table scan, in its own TOC entry */
+	pscan = (ParallelTableScanDesc)
+		shm_toc_allocate(pcxt->toc,
+						 table_parallelscan_estimate(heap, snapshot));
 	table_parallelscan_initialize(heap, pscan, snapshot);
+	shm_toc_insert(pcxt->toc, pscan_key, pscan);
 }
 
 static inline void
 ParallelIndexBuildWaitForWorkers(ParallelIndexBuildShared * shared,
-								 int nparticipants,
+								 int nparticipants, IndexInfo *indexInfo,
 								 double *reltuples, double *indtuples,
-								 bool *havedead, bool *brokenhotchain)
+								 bool *havedead)
 {
 	for (;;)
 	{
@@ -140,8 +152,8 @@ ParallelIndexBuildWaitForWorkers(ParallelIndexBuildShared * shared,
 			*indtuples = shared->indtuples;
 			if (havedead)
 				*havedead = shared->havedead;
-			if (brokenhotchain)
-				*brokenhotchain = shared->brokenhotchain;
+			if (shared->brokenhotchain)
+				indexInfo->ii_BrokenHotChain = true;
 			SpinLockRelease(&shared->mutex);
 			break;
 		}
@@ -231,10 +243,44 @@ ParallelIndexBuildCloseRelations(ParallelIndexBuildShared * shared,
 	table_close(heapRel, heapLockmode);
 }
 
+static inline double
+ParallelIndexBuildScan(ParallelIndexBuildShared * shared, shm_toc *toc,
+					   uint64 pscan_key, Relation heap, Relation index,
+					   bool progress, IndexBuildCallback callback,
+					   void *callback_state)
+{
+	ParallelTableScanDesc pscan;
+	IndexInfo  *indexInfo;
+	TableScanDesc scan;
+	double		reltuples;
+
+	indexInfo = BuildIndexInfo(index);
+	indexInfo->ii_Concurrent = shared->isconcurrent;
+
+	pscan = shm_toc_lookup(toc, pscan_key, false);
+	scan = table_beginscan_parallel(heap, pscan
+#if PG_VERSION_NUM >= 190000
+									,SO_NONE
+#endif
+		);
+	reltuples = table_index_build_scan(heap, index, indexInfo, true, progress,
+									   callback, callback_state, scan);
+
+	/* Record a broken HOT chain, so the leader can mark indcheckxmin */
+	if (indexInfo->ii_BrokenHotChain)
+	{
+		SpinLockAcquire(&shared->mutex);
+		shared->brokenhotchain = true;
+		SpinLockRelease(&shared->mutex);
+	}
+
+	return reltuples;
+}
+
 static inline void
 ParallelIndexBuildReportScanDone(ParallelIndexBuildShared * shared,
 								 double reltuples, double indtuples,
-								 bool havedead, bool brokenhotchain)
+								 bool havedead)
 {
 	SpinLockAcquire(&shared->mutex);
 	shared->nparticipantsdone++;
@@ -242,8 +288,6 @@ ParallelIndexBuildReportScanDone(ParallelIndexBuildShared * shared,
 	shared->indtuples += indtuples;
 	if (havedead)
 		shared->havedead = true;
-	if (brokenhotchain)
-		shared->brokenhotchain = true;
 	SpinLockRelease(&shared->mutex);
 
 	/* Notify leader */

@@ -258,9 +258,6 @@ typedef struct HnswShared
 	HnswGraph	graphData;
 }			HnswShared;
 
-#define ParallelTableScanFromHnswShared(shared) \
-	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(HnswShared)))
-
 typedef struct HnswLeader
 {
 	ParallelContext *pcxt;

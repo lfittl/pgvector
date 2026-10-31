@@ -147,9 +147,6 @@ typedef struct IvfflatShared
 #endif
 }			IvfflatShared;
 
-#define ParallelTableScanFromIvfflatShared(shared) \
-	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(IvfflatShared)))
-
 typedef struct IvfflatLeader
 {
 	ParallelContext *pcxt;

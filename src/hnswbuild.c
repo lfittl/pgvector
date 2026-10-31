@@ -75,6 +75,7 @@
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
 #define PARALLEL_KEY_WAL_USAGE			UINT64CONST(0xA000000000000004)
 #define PARALLEL_KEY_BUFFER_USAGE		UINT64CONST(0xA000000000000005)
+#define PARALLEL_KEY_TABLE_SCAN			UINT64CONST(0xA000000000000006)
 
 #define HNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
 
@@ -763,7 +764,8 @@ ParallelHeapScan(HnswBuildState * buildstate)
 	/* indtuples is unused, since the shared graph tracks it instead */
 	ParallelIndexBuildWaitForWorkers(&hnswleader->hnswshared->base,
 									 hnswleader->nparticipanttuplesorts,
-									 &reltuples, &indtuples, NULL, NULL);
+									 buildstate->indexInfo,
+									 &reltuples, &indtuples, NULL);
 
 	buildstate->graph = &hnswleader->hnswshared->graphData;
 	buildstate->hnswarea = hnswleader->hnswarea;
@@ -775,29 +777,22 @@ ParallelHeapScan(HnswBuildState * buildstate)
  * Perform a worker's portion of a parallel insert
  */
 static void
-HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, bool progress)
+HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, shm_toc *toc, char *hnswarea, bool progress)
 {
 	HnswBuildState buildstate;
-	TableScanDesc scan;
 	double		reltuples;
-	IndexInfo  *indexInfo;
 
-	/* Join parallel scan */
-	indexInfo = BuildIndexInfo(indexRel);
-	indexInfo->ii_Concurrent = hnswshared->base.isconcurrent;
-	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
+	/* The IndexInfo for the scan is owned by ParallelIndexBuildScan */
+	InitBuildState(&buildstate, heapRel, indexRel, NULL, MAIN_FORKNUM);
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
-	scan = table_beginscan_parallel(heapRel,
-									ParallelTableScanFromHnswShared(hnswshared)
-#if PG_VERSION_NUM >= 190000
-									,SO_NONE
-#endif
-		);
-	reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
-									   true, progress, BuildCallback,
-									   (void *) &buildstate, scan);
+
+	/* Join parallel scan */
+	reltuples = ParallelIndexBuildScan(&hnswshared->base, toc,
+									   PARALLEL_KEY_TABLE_SCAN, heapRel,
+									   indexRel, progress, BuildCallback,
+									   (void *) &buildstate);
 
 	/* Log statistics */
 	if (progress)
@@ -806,7 +801,7 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 		ereport(DEBUG1, (errmsg("worker processed " INT64_FORMAT " tuples", (int64) reltuples)));
 
 	/* Record statistics and notify leader */
-	ParallelIndexBuildReportScanDone(&hnswshared->base, reltuples, 0, false, false);
+	ParallelIndexBuildReportScanDone(&hnswshared->base, reltuples, 0, false);
 
 	FreeBuildState(&buildstate);
 }
@@ -839,7 +834,7 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 	InstrStartParallelQuery();
 
 	/* Perform inserts */
-	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, false);
+	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, toc, hnswarea, false);
 
 	/* Report WAL/buffer usage during parallel execution */
 	bufferusage = shm_toc_lookup(toc, PARALLEL_KEY_BUFFER_USAGE, false);
@@ -870,7 +865,7 @@ HnswLeaderParticipateAsWorker(HnswBuildState * buildstate)
 	HnswLeader *hnswleader = buildstate->hnswleader;
 
 	/* Perform work common to all participants */
-	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->hnswarea, true);
+	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->pcxt->toc, hnswleader->hnswarea, true);
 }
 
 /*
@@ -903,8 +898,8 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	snapshot = ParallelIndexBuildGetSnapshot(isconcurrent);
 
 	/* Estimate size of workspaces */
-	esthnswshared = ParallelIndexBuildEstimateShared(buildstate->heap, snapshot,
-													 sizeof(HnswShared));
+	ParallelIndexBuildEstimate(pcxt, buildstate->heap, snapshot);
+	esthnswshared = sizeof(HnswShared);
 	shm_toc_estimate_chunk(&pcxt->estimator, esthnswshared);
 
 	/* Leave space for other objects in shared memory */
@@ -943,12 +938,11 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 
 	/* Store shared build state, for which we reserved space */
 	hnswshared = (HnswShared *) shm_toc_allocate(pcxt->toc, esthnswshared);
-	/* Initialize common state, and the parallel scan that follows the struct */
+	/* Initialize common state, and the parallel table scan */
 	/* (no tuplesorts are used, so scantuplesortstates is not needed) */
-	ParallelIndexBuildInitShared(&hnswshared->base, buildstate->heap,
-								 buildstate->index, isconcurrent, 0,
-								 ParallelTableScanFromHnswShared(hnswshared),
-								 snapshot);
+	ParallelIndexBuildInitShared(pcxt, &hnswshared->base,
+								 PARALLEL_KEY_TABLE_SCAN, buildstate->heap,
+								 buildstate->index, isconcurrent, 0, snapshot);
 
 	hnswarea = (char *) shm_toc_allocate(pcxt->toc, esthnswarea);
 	InitGraph(&hnswshared->graphData, hnswarea, esthnswarea);
